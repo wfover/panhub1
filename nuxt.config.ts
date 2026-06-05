@@ -36,8 +36,6 @@ export default defineNuxtConfig({
     },
   },
   nitro: {
-    // better-sqlite3 是 native 模块，不能被 Nitro 打包
-    serverExternalPackages: ["better-sqlite3"],
     // 根据环境变量动态选择部署预设
     preset: process.env.VERCEL
       ? "vercel"

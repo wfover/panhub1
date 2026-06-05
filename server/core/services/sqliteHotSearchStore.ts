@@ -1,6 +1,5 @@
 import type { IHotSearchStore, HotSearchItem, HotSearchStats } from "./hotSearchStore";
-import { createRequire } from "node:module";
-const require = createRequire(import.meta.url);
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 
 const MAX_ENTRIES = 30;
 const DEFAULT_DB_DIR = "./data";
@@ -26,13 +25,18 @@ function normalize(term: string): string | null {
   return t || null;
 }
 
+/**
+ * SQLite 热搜存储实现（sql.js 纯 JS 版本）
+ * 无需 native 编译，Docker/CF Workers/Node 均可运行
+ */
 export class SqliteHotSearchStore implements IHotSearchStore {
   private db: any;
+  private dbPath: string;
+  private dbDir: string;
   private isInitialized = false;
   private initFailed = false;
   private initPromise: Promise<void> | null = null;
-  private dbPath: string;
-  private dbDir: string;
+  private saveTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(dbPath?: string) {
     this.dbPath = dbPath || DEFAULT_DB_PATH;
@@ -51,64 +55,78 @@ export class SqliteHotSearchStore implements IHotSearchStore {
   }
 
   private async init(): Promise<void> {
-    const Database = require("better-sqlite3");
-    const { mkdirSync, existsSync } = await import("node:fs");
+    const initSqlJs = (await import("sql.js")).default;
+    const SQL = await initSqlJs();
+
     if (!existsSync(this.dbDir)) {
       mkdirSync(this.dbDir, { recursive: true });
     }
 
-    this.db = new Database(this.dbPath);
-    this.db.pragma("journal_mode = WAL");
-    this.db.pragma("busy_timeout = 5000");
+    // 从文件加载已有数据，或创建新数据库
+    if (existsSync(this.dbPath)) {
+      const buffer = readFileSync(this.dbPath);
+      this.db = new SQL.Database(buffer);
+    } else {
+      this.db = new SQL.Database();
+    }
 
-    this.db.exec(`
+    this.db.run(`
       CREATE TABLE IF NOT EXISTS hot_searches (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         term TEXT NOT NULL UNIQUE,
         score INTEGER NOT NULL DEFAULT 1,
         last_searched_at INTEGER NOT NULL,
         created_at INTEGER NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS idx_score ON hot_searches(score DESC);
-      CREATE INDEX IF NOT EXISTS idx_last_searched ON hot_searches(last_searched_at DESC);
+      )
     `);
+    this.db.run("CREATE INDEX IF NOT EXISTS idx_score ON hot_searches(score DESC)");
+    this.db.run("CREATE INDEX IF NOT EXISTS idx_last_searched ON hot_searches(last_searched_at DESC)");
 
-    // 迁移：从 JSON 文件导入历史数据（仅首次）
-    await this.migrateFromJson();
+    // 迁移 JSON 数据
+    this.migrateFromJson();
 
-    console.log("[SqliteHotSearchStore] ✅ SQLite 存储已初始化");
+    this.saveToDisk();
+    console.log("[SqliteHotSearchStore] ✅ SQLite (sql.js) 存储已初始化");
   }
 
-  private async migrateFromJson(): Promise<void> {
-    // 测试模式（自定义 dbPath）不迁移
+  private migrateFromJson(): void {
     if (this.dbPath !== DEFAULT_DB_PATH) return;
     const JSON_PATH = "./data/hot-searches.json";
     try {
-      const { existsSync, readFileSync } = await import("node:fs");
       if (!existsSync(JSON_PATH)) return;
 
       const raw = readFileSync(JSON_PATH, "utf-8");
       const data = JSON.parse(raw);
       if (!data?.items?.length) return;
 
-      const count = this.db.prepare("SELECT COUNT(*) as c FROM hot_searches").get().c;
-      if (count > 0) return; // 已有数据，跳过迁移
+      const result = this.db.exec("SELECT COUNT(*) as c FROM hot_searches");
+      const count = result[0]?.values[0]?.[0] ?? 0;
+      if (count > 0) return;
 
-      const insert = this.db.prepare("INSERT OR IGNORE INTO hot_searches (term, score, last_searched_at, created_at) VALUES (?, ?, ?, ?)");
-      const insertMany = this.db.transaction((items: any[]) => {
-        for (const item of items) {
-          const normalized = normalize(item.term);
-          if (normalized && !isForbidden(normalized)) {
-            insert.run(normalized, item.score || 1, item.lastSearched || Date.now(), item.createdAt || Date.now());
-          }
+      const stmt = this.db.prepare("INSERT OR IGNORE INTO hot_searches (term, score, last_searched_at, created_at) VALUES (?, ?, ?, ?)");
+      for (const item of data.items) {
+        const normalized = normalize(item.term);
+        if (normalized && !isForbidden(normalized)) {
+          stmt.run([normalized, item.score || 1, item.lastSearched || Date.now(), item.createdAt || Date.now()]);
         }
-      });
+      }
+      stmt.free();
+      this.saveToDisk();
+      console.log(`[SqliteHotSearchStore] ✅ 从 JSON 迁移了 ${data.items.length} 条数据`);
+    } catch {}
+  }
 
-      insertMany(data.items);
-      console.log(`[SqliteHotSearchStore] ✅ 从 JSON 迁移了 ${data.items.length} 条热搜数据`);
-    } catch {
-      // JSON 文件不存在或解析失败，静默跳过
-    }
+  private saveToDisk(): void {
+    try {
+      const data = this.db.export();
+      const buffer = Buffer.from(data);
+      writeFileSync(this.dbPath, buffer);
+    } catch {}
+  }
+
+  private scheduleSave(): void {
+    if (this.saveTimer) clearTimeout(this.saveTimer);
+    this.saveTimer = setTimeout(() => this.saveToDisk(), 500);
   }
 
   private async waitForInit(): Promise<void> {
@@ -123,54 +141,66 @@ export class SqliteHotSearchStore implements IHotSearchStore {
     if (!normalized) return;
     if (isForbidden(normalized)) return;
 
-    const existing = this.db.prepare("SELECT score FROM hot_searches WHERE term = ?").get(normalized);
-    if (existing) {
-      this.db.prepare("UPDATE hot_searches SET score = score + 1, last_searched_at = ? WHERE term = ?").run(now, normalized);
+    const existing = this.db.exec("SELECT score FROM hot_searches WHERE term = ?", [normalized]);
+    if (existing.length > 0 && existing[0].values.length > 0) {
+      this.db.run("UPDATE hot_searches SET score = score + 1, last_searched_at = ? WHERE term = ?", [now, normalized]);
     } else {
-      this.db.prepare("INSERT INTO hot_searches (term, score, last_searched_at, created_at) VALUES (?, 1, ?, ?)").run(normalized, now, now);
+      this.db.run("INSERT INTO hot_searches (term, score, last_searched_at, created_at) VALUES (?, 1, ?, ?)", [normalized, now, now]);
     }
 
-    await this.cleanupOldEntries(MAX_ENTRIES);
+    this.cleanupOldEntries(MAX_ENTRIES);
+    this.scheduleSave();
   }
 
   async getHotSearches(limit: number): Promise<HotSearchItem[]> {
     await this.waitForInit();
-    const rows = this.db.prepare(`
+    const now = Date.now();
+    const result = this.db.exec(`
       SELECT term, score, last_searched_at, created_at,
-        score * exp(-0.05 * ((? - last_searched_at) / 86400000.0)) as decayed_score
+        score * exp(-0.05 * ((${now} - last_searched_at) / 86400000.0)) as decayed_score
       FROM hot_searches
       ORDER BY decayed_score DESC
-      LIMIT ?
-    `).all(Date.now(), Math.min(limit, MAX_ENTRIES));
+      LIMIT ${Math.min(limit, MAX_ENTRIES)}
+    `);
 
-    return rows.map((row: any, index: number) => ({
-      term: row.term,
-      score: row.score,
-      lastSearched: row.last_searched_at,
-      createdAt: row.created_at,
-      rank: index + 1,
-      displayScore: Math.round(row.decayed_score * 100) / 100,
-    }));
+    if (!result.length) return [];
+    const cols = result[0].columns;
+    return result[0].values.map((row: any[], index: number) => {
+      const obj: any = {};
+      cols.forEach((col: string, i: number) => obj[col] = row[i]);
+      return {
+        term: obj.term,
+        score: obj.score,
+        lastSearched: obj.last_searched_at,
+        createdAt: obj.created_at,
+        rank: index + 1,
+        displayScore: Math.round(obj.decayed_score * 100) / 100,
+      };
+    });
   }
 
-  async cleanupOldEntries(maxEntries: number): Promise<void> {
-    this.db.prepare(`
+  cleanupOldEntries(maxEntries: number): void {
+    this.db.run(`
       DELETE FROM hot_searches WHERE id NOT IN (
         SELECT id FROM hot_searches ORDER BY score DESC, last_searched_at DESC LIMIT ?
       )
-    `).run(maxEntries);
+    `, [maxEntries]);
   }
 
   async clearHotSearches(): Promise<{ success: boolean; message: string }> {
     await this.waitForInit();
-    this.db.prepare("DELETE FROM hot_searches").run();
+    this.db.run("DELETE FROM hot_searches");
+    this.saveToDisk();
     return { success: true, message: "热搜记录已清除" };
   }
 
   async deleteHotSearch(term: string): Promise<{ success: boolean; message: string }> {
     await this.waitForInit();
-    const result = this.db.prepare("DELETE FROM hot_searches WHERE term = ?").run(term);
-    if (result.changes > 0) {
+    const before = this.db.exec("SELECT COUNT(*) as c FROM hot_searches WHERE term = ?", [term]);
+    const had = before[0]?.values[0]?.[0] ?? 0;
+    this.db.run("DELETE FROM hot_searches WHERE term = ?", [term]);
+    if (had > 0) {
+      this.saveToDisk();
       return { success: true, message: `热搜词 "${term}" 已删除` };
     }
     return { success: false, message: "热搜词不存在" };
@@ -178,15 +208,16 @@ export class SqliteHotSearchStore implements IHotSearchStore {
 
   async getStats(): Promise<HotSearchStats> {
     await this.waitForInit();
-    const total = this.db.prepare("SELECT COUNT(*) as count FROM hot_searches").get().count;
+    const result = this.db.exec("SELECT COUNT(*) as c FROM hot_searches");
+    const total = result[0]?.values[0]?.[0] ?? 0;
     const topTerms = await this.getHotSearches(10);
     return { total, topTerms };
   }
 
   getDbSize(): number {
     try {
-      const { existsSync, statSync } = require("node:fs");
       if (existsSync(this.dbPath)) {
+        const { statSync } = require("node:fs");
         return Math.round((statSync(this.dbPath).size / (1024 * 1024)) * 100) / 100;
       }
     } catch {}
@@ -194,7 +225,9 @@ export class SqliteHotSearchStore implements IHotSearchStore {
   }
 
   close(): void {
+    if (this.saveTimer) clearTimeout(this.saveTimer);
     if (this.db) {
+      this.saveToDisk();
       this.db.close();
     }
   }
