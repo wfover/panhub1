@@ -70,7 +70,7 @@
                 <div v-else class="cover-placeholder">🎬</div>
               </div>
               <div class="card-info">
-                <span class="card-title">{{ extractTerm(item.title) }}</span>
+                <span class="card-title">{{ item.title }}</span>
                 <span v-if="item.desc" class="card-desc">{{ item.desc }}</span>
               </div>
             </button>
