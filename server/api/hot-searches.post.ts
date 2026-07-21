@@ -32,7 +32,7 @@ export default defineEventHandler(async (event) => {
 
   const service = getOrCreateHotSearchService();
   await service.recordSearch(term);
-  loggers.hotSearch.info(`记录热搜: "${term}"`);
+  loggers.hotSearch.debug(`记录热搜: "${term}"`);
 
   return {
     code: 0,

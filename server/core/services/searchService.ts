@@ -186,7 +186,7 @@ export class SearchService {
     }
 
     const requestMs = Date.now() - requestStart;
-    loggers.search.info("搜索请求完成", {
+    loggers.search.debug("搜索请求完成", {
       keyword,
       total,
       tgCount: tgResults.length,
@@ -406,14 +406,6 @@ export class SearchService {
 
         const responseTime = Date.now() - startTime;
         this.healthChecker.recordSuccess(pluginName, responseTime);
-
-        loggers.search.debug("单插件完成", {
-          plugin: pluginName,
-          ms: responseTime,
-          count: results.length,
-          empty: results.length === 0,
-          keyword,
-        });
 
         return results;
       } catch (error) {
